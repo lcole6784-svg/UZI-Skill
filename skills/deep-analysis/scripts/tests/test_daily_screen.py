@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pandas as pd
+import pytest
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS))
@@ -23,6 +25,50 @@ def test_universe_filters_st_invalid_quote_and_low_turnover():
     kept, stats = apply_hard_filters(normalized, 2e8)
     assert [item.code for item in kept] == ["600001.SH"]
     assert stats["removed_low_turnover"] == 1
+
+
+def test_a_universe_falls_back_to_sina_and_normalizes_prefixed_code(monkeypatch):
+    import akshare as ak
+    from lib.daily_screen.universe import fetch_market_universe
+
+    monkeypatch.setattr(ak, "stock_zh_a_spot_em", Mock(side_effect=RuntimeError("502 Bad Gateway")))
+    monkeypatch.setattr(ak, "stock_zh_a_spot", lambda: pd.DataFrame([{
+        "代码": "sh600001", "名称": "正常股份", "最新价": 10, "涨跌幅": 4,
+        "成交额": 3e8, "昨收": 9.6, "今开": 9.8, "最高": 10.1, "最低": 9.7,
+    }]))
+
+    stocks = fetch_market_universe("A")
+    assert len(stocks) == 1
+    assert stocks[0].code == "600001.SH"
+    assert stocks[0].source == "akshare:stock_zh_a_spot"
+
+
+def test_hk_universe_falls_back_to_sina_and_accepts_chinese_name(monkeypatch):
+    import akshare as ak
+    from lib.daily_screen.universe import fetch_market_universe
+
+    monkeypatch.setattr(ak, "stock_hk_spot_em", lambda: pd.DataFrame())
+    monkeypatch.setattr(ak, "stock_hk_spot", lambda: pd.DataFrame([{
+        "代码": "00700", "中文名称": "腾讯控股", "最新价": 500, "涨跌幅": 3,
+        "成交额": 30e8, "昨收": 490, "今开": 495, "最高": 505, "最低": 492,
+    }]))
+
+    stocks = fetch_market_universe("H")
+    assert len(stocks) == 1
+    assert stocks[0].code == "00700.HK"
+    assert stocks[0].name == "腾讯控股"
+    assert stocks[0].source == "akshare:stock_hk_spot"
+
+
+def test_universe_raises_clear_error_when_all_sources_fail(monkeypatch):
+    import akshare as ak
+    from lib.daily_screen.universe import fetch_market_universe
+
+    monkeypatch.setattr(ak, "stock_hk_spot_em", Mock(side_effect=RuntimeError("primary down")))
+    monkeypatch.setattr(ak, "stock_hk_spot", Mock(side_effect=RuntimeError("fallback down")))
+
+    with pytest.raises(RuntimeError, match=r"stock_hk_spot_em.*stock_hk_spot"):
+        fetch_market_universe("H")
 
 
 def test_hk_skips_f_personas_but_keeps_serenity():
