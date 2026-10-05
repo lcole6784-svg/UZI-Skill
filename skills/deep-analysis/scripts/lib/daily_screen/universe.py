@@ -10,7 +10,7 @@ from .models import StockSnapshot
 
 _COLUMN_ALIASES = {
     "code": ("代码", "symbol", "代码编号"),
-    "name": ("名称", "name", "股票名称"),
+    "name": ("名称", "中文名称", "name", "股票名称"),
     "price": ("最新价", "现价", "price", "最新"),
     "change_pct": ("涨跌幅", "涨幅", "change_pct"),
     "amount": ("成交额", "amount", "成交金额"),
@@ -41,14 +41,33 @@ def _number(value: Any) -> float | None:
 
 
 def _full_code(code: Any, market: str) -> str:
-    raw = str(code or "").strip().split(".")[0]
+    text = str(code or "").strip().lower()
+    if not text:
+        return ""
+
+    # EastMoney usually returns bare numeric codes while Sina A-share spot
+    # returns exchange-prefixed symbols such as sh600000/sz000001/bj430017.
+    if "." in text:
+        text = text.split(".", 1)[0]
+
+    explicit_suffix = None
+    for prefix, suffix in (("sh", "SH"), ("sz", "SZ"), ("bj", "BJ"), ("hk", "HK")):
+        if text.startswith(prefix) and text[len(prefix):].isdigit():
+            text = text[len(prefix):]
+            explicit_suffix = suffix
+            break
+
+    raw = text
     if not raw.isdigit():
         return ""
     if market == "H":
         return f"{raw.zfill(5)}.HK"
     if len(raw) != 6:
         return ""
-    suffix = "BJ" if raw.startswith(("4", "8", "92")) else ("SH" if raw.startswith(("5", "6", "9")) else "SZ")
+    if explicit_suffix in ("SH", "SZ", "BJ"):
+        suffix = explicit_suffix
+    else:
+        suffix = "BJ" if raw.startswith(("4", "8", "92")) else ("SH" if raw.startswith(("5", "6", "9")) else "SZ")
     return f"{raw.zfill(6)}.{suffix}"
 
 
@@ -104,14 +123,39 @@ def apply_hard_filters(stocks: list[StockSnapshot], min_turnover_local: float) -
 
 
 def fetch_market_universe(market: str) -> list[StockSnapshot]:
+    """Fetch an A/H whole-market snapshot with an independent-source fallback.
+
+    EastMoney remains the primary source because it is richer and faster when
+    reachable. Codex/overseas containers sometimes receive 5xx responses from
+    EastMoney, so fall back to AKShare's Sina whole-market endpoints instead
+    of turning the entire daily screen into an empty result.
+    """
     import akshare as ak
 
-    if market.upper() == "A":
-        frame = ak.stock_zh_a_spot_em()
-        observed_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        return normalize_universe_frame(frame, "A", observed_at, "akshare:stock_zh_a_spot_em")
-    if market.upper() == "H":
-        frame = ak.stock_hk_spot_em()
-        observed_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        return normalize_universe_frame(frame, "H", observed_at, "akshare:stock_hk_spot_em")
-    raise ValueError(f"daily screen only supports A/H markets, got {market!r}")
+    market = market.upper()
+    if market == "A":
+        providers = (
+            ("stock_zh_a_spot_em", ak.stock_zh_a_spot_em),
+            ("stock_zh_a_spot", ak.stock_zh_a_spot),
+        )
+    elif market == "H":
+        providers = (
+            ("stock_hk_spot_em", ak.stock_hk_spot_em),
+            ("stock_hk_spot", ak.stock_hk_spot),
+        )
+    else:
+        raise ValueError(f"daily screen only supports A/H markets, got {market!r}")
+
+    errors = []
+    for name, provider in providers:
+        try:
+            frame = provider()
+            observed_at = datetime.now().astimezone().isoformat(timespec="seconds")
+            snapshots = normalize_universe_frame(frame, market, observed_at, f"akshare:{name}")
+            if snapshots:
+                return snapshots
+            errors.append(f"{name}:empty_or_unrecognized")
+        except Exception as exc:
+            errors.append(f"{name}:{type(exc).__name__}:{str(exc)[:120]}")
+
+    raise RuntimeError(f"all {market} universe providers failed: {'; '.join(errors)}")
